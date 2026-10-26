@@ -226,6 +226,9 @@ test('the cache returns a message by relay id or by snowflake', () => {
   assert.equal(cache.get('nope'), undefined);
 });
 
+/** The snowflake index is private; its size is what shows a leak, since a stale entry answers nothing. */
+const nativeIndexSize = (cache: DigestCache): number => (cache as unknown as { nativeToId: Map<string, string> }).nativeToId.size;
+
 test('the cache keeps the newest N and lets the oldest go, by both keys', () => {
   const cache = new DigestCache(3);
   const ms = Array.from({ length: 5 }, () => msg());
@@ -235,6 +238,7 @@ test('the cache keeps the newest N and lets the oldest go, by both keys', () => 
   assert.equal(cache.get(ms[0]!.nativeId), undefined);
   assert.equal(cache.get(ms[1]!.nativeId), undefined);
   for (const m of ms.slice(2)) assert.equal(cache.get(m.id), m);
+  assert.equal(nativeIndexSize(cache), 3, 'the snowflake index forgets what was evicted, or it grows without bound');
 });
 
 test('putting a message again refreshes it instead of keeping a copy', () => {
@@ -264,6 +268,7 @@ test('an edited message is refreshed in place, a deleted one is dropped, and one
   assert.equal(cache.get(m.id), undefined);
   assert.equal(cache.get(m.nativeId), undefined);
   assert.doesNotThrow(() => cache.drop('never-there'));
+  assert.equal(nativeIndexSize(cache), 0, 'a dropped message leaves nothing behind in the snowflake index');
 });
 
 test('RecentIds keeps the newest N ids', () => {
