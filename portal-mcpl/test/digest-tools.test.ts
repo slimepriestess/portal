@@ -8,7 +8,8 @@ import assert from 'node:assert/strict';
 import { PortalClient } from '@animalabs/portal-client';
 import type { PortalMessage } from '@animalabs/portal-protocol';
 import { PortalAgent } from '../src/agent.js';
-import { toolDefinitions } from '../src/tools.js';
+import { PortalCcChannelServer } from '../src/server-cc.js';
+import { digestToolDefinitions, toolDefinitions } from '../src/tools.js';
 
 const CHANNEL = '100000000000000003';
 const NO_MENTIONS = { personas: [], roles: [], users: [], everyone: false };
@@ -32,7 +33,7 @@ function setup(opts: { digestView?: boolean } = {}, history: PortalMessage[] = [
     return { messages: history };
   };
   const agent = new PortalAgent(client, { hostOwnsChannelLifecycle: true, ...opts });
-  return { agent, fetches, history };
+  return { agent, fetches, history, client };
 }
 const served = (agent: PortalAgent, name: string) => agent.tools.find((t) => t.name === name);
 function withEnv<T>(value: string | undefined, fn: () => T): T {
@@ -97,8 +98,10 @@ test('off: fetch_history and fetch_around return the relay\'s messages untouched
     const history = [msg(words(100)), msg('short')];
     const { agent } = setup({}, history);
     assert.deepEqual(await agent.handleToolCall('fetch_history', { channelId: CHANNEL }), { messages: history });
+    // Both halves of the window come from the same page here, so a correct merge is that page once, oldest first.
     const around = (await agent.handleToolCall('fetch_around', { channelId: CHANNEL, messageId: 'rel-1' })) as { messages: PortalMessage[] };
-    assert.ok(Array.isArray(around.messages));
+    assert.deepEqual(around.messages.map((m) => m.id), [...history].sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1)).map((m) => m.id));
+    assert.equal(around.messages.length, history.length, 'duplicates from the two halves are merged');
   });
 });
 
@@ -135,7 +138,7 @@ test('on: view "digest" returns one line per message, a note, and asks the relay
   const history = [msg(words(60)), msg('short one')];
   const { agent, fetches } = setup({ digestView: true }, history);
   const out = (await agent.handleToolCall('fetch_history', { channelId: CHANNEL, limit: 2, view: 'digest', words: 10 })) as {
-    view: string; count: number; note: string; lines: string[];
+    view: string; count: number; note: string; ids: string[]; lines: string[];
   };
   assert.equal(out.view, 'digest');
   assert.equal(out.count, 2);
@@ -143,6 +146,8 @@ test('on: view "digest" returns one line per message, a note, and asks the relay
   assert.ok(out.lines[0]!.includes('… (+50 words, full: '), out.lines[0]);
   assert.ok(out.lines[1]!.endsWith(': short one'));
   assert.match(out.note, /fetch_message/);
+  assert.match(out.note, /UTC/);
+  assert.deepEqual(out.ids, history.map((m) => m.id).sort((a, b) => (history.find((x) => x.id === a)!.createdAt < history.find((x) => x.id === b)!.createdAt ? -1 : 1)));
   assert.equal(fetches.length, 1);
   assert.equal(fetches[0]!.limit, 2, 'the page size is the caller\'s, not changed by the view');
   assert.ok(!('view' in fetches[0]!) && !('words' in fetches[0]!), 'the relay is not sent a view it does not know');
@@ -152,18 +157,21 @@ test('on: the digest knows the agent\'s own persona, so a message that mentions 
   const history = [msg(words(80), { mentions: { ...NO_MENTIONS, personas: ['persona-me'] } }), msg(words(80))];
   const { agent } = setup({ digestView: true }, history);
   const out = (await agent.handleToolCall('fetch_history', { channelId: CHANNEL, view: 'digest', words: 5 })) as { lines: string[] };
-  const [a, b] = out.lines.slice().sort((x, y) => x.localeCompare(y));
-  const whole = out.lines.find((l) => l.includes('★mentions-you'))!;
+  const whole = out.lines.find((l) => l.includes('★to-you'))!;
   assert.ok(whole.endsWith('w80'));
-  assert.ok(out.lines.some((l) => l.includes('… (+75 words')), `${a} / ${b}`);
+  assert.ok(out.lines.some((l) => l.includes('… (+75 words')), out.lines.join('\n'));
 });
 
-test('on: fetch_around digests the window it already builds, merged and sorted', async () => {
-  const history = [msg(words(40)), msg('x')];
-  const { agent } = setup({ digestView: true }, history);
-  const out = (await agent.handleToolCall('fetch_around', { channelId: CHANNEL, messageId: 'rel-1', view: 'digest', words: 5 })) as { lines: string[]; count: number };
-  assert.ok(out.count >= 1 && out.lines.length === out.count);
-  assert.ok(out.lines.every((l) => /^#\d+ /.test(l)));
+test('on: fetch_around digests the window it already builds: halves merged once, oldest first, cut at words', async () => {
+  const late = msg('closing line', { createdAt: '2026-10-20T16:00:00.000Z' });
+  const early = msg(words(40), { createdAt: '2026-10-20T14:00:00.000Z' });
+  // The stub gives both halves the same page, so a correct window holds each message once.
+  const { agent } = setup({ digestView: true }, [late, early]);
+  const out = (await agent.handleToolCall('fetch_around', { channelId: CHANNEL, messageId: 'rel-1', view: 'digest', words: 5 })) as { lines: string[]; count: number; ids: string[] };
+  assert.equal(out.count, 2);
+  assert.deepEqual(out.ids, [early.id, late.id]);
+  assert.match(out.lines[0]!, /^#1 10-20 14:00 Ada: w1 w2 w3 w4 w5… \(\+35 words, full: rel-\d+\)$/);
+  assert.match(out.lines[1]!, /^#2 10-20 16:00 Ada: closing line$/);
 });
 
 test('on: fetch_message returns the whole message a digest cut, by relay id and by snowflake', async () => {
@@ -208,4 +216,87 @@ test('the host-owned-channels filter still applies with the digest on', () => {
   const { agent } = setup({ digestView: true });
   assert.equal(served(agent, 'subscribe_channel'), undefined);
   assert.ok(served(agent, 'fetch_history') && served(agent, 'send_message'));
+});
+
+// ── the public list, the cache's freshness, replies to older posts, and the server path ──
+
+test('the public toolDefinitions is the surface a server without the view offers: no fetch_message, no view or words', () => {
+  assert.ok(!toolDefinitions.some((t) => t.name === 'fetch_message'));
+  for (const name of ['fetch_history', 'fetch_around']) {
+    const props = toolDefinitions.find((t) => t.name === name)!.inputSchema.properties;
+    assert.ok(!('view' in props) && !('words' in props), name);
+  }
+  assert.deepEqual(digestToolDefinitions.map((t) => t.name), ['fetch_message']);
+});
+
+test('fetch_message follows an edit the client was told of, and forgets a message the client was told was deleted', async () => {
+  const m = msg(words(90));
+  const { agent, client } = setup({ digestView: true }, [m]);
+  await agent.handleToolCall('fetch_history', { channelId: CHANNEL, view: 'digest', words: 5 });
+  const emit = (event: string, payload: unknown) => (client as unknown as { emit(e: string, p: unknown): void }).emit(event, payload);
+  emit('messageUpdate', { message: { ...m, content: 'edited text', cleanContent: 'edited text' }, addressedToMe: false, reasons: [] });
+  const edited = (await agent.handleToolCall('fetch_message', { messageId: m.id })) as { message: PortalMessage };
+  assert.equal(edited.message.cleanContent, 'edited text');
+  emit('messageDelete', { channelId: CHANNEL, messageId: m.id });
+  await assert.rejects(agent.handleToolCall('fetch_message', { messageId: m.id }), /isn't in this server's digest cache/);
+});
+
+test('a reply to an older post of the agent\'s own, outside the batch, comes back whole when this server sent that post', async () => {
+  const client = new PortalClient({ url: 'ws://test', token: 't', personaId: 'persona-me' });
+  const reply = msg(words(80), { replyToId: 'rm_c_sent_earlier' });
+  (client as unknown as { sendMessage: unknown }).sendMessage = async () => ({ messageId: 'rm_c_sent_earlier' });
+  (client as unknown as { fetchHistory: unknown }).fetchHistory = async () => ({ messages: [reply] });
+  const agent = new PortalAgent(client, { hostOwnsChannelLifecycle: true, digestView: true });
+  const before = (await agent.handleToolCall('fetch_history', { channelId: CHANNEL, view: 'digest', words: 5 })) as { lines: string[] };
+  assert.ok(before.lines[0]!.includes('… (+75 words'), 'before the agent has posted, it is just a reply to something unseen');
+  await agent.handleToolCall('send_message', { channelId: CHANNEL, content: 'hello' });
+  const after = (await agent.handleToolCall('fetch_history', { channelId: CHANNEL, view: 'digest', words: 5 })) as { lines: string[] };
+  assert.ok(after.lines[0]!.includes('★to-you') && after.lines[0]!.endsWith('w80'), after.lines[0]);
+});
+
+test('a message of the agent\'s own that a digest showed is remembered, so a later reply to it counts', async () => {
+  const mine = msg('my old post', { author: { kind: 'persona', personaId: 'persona-me', displayName: 'me', avatarUrl: '' } });
+  const client = new PortalClient({ url: 'ws://test', token: 't', personaId: 'persona-me' });
+  let page: PortalMessage[] = [mine];
+  (client as unknown as { fetchHistory: unknown }).fetchHistory = async () => ({ messages: page });
+  const agent = new PortalAgent(client, { hostOwnsChannelLifecycle: true, digestView: true });
+  await agent.handleToolCall('fetch_history', { channelId: CHANNEL, view: 'digest' });
+  page = [msg(words(80), { replyToId: mine.id })];
+  const out = (await agent.handleToolCall('fetch_history', { channelId: CHANNEL, view: 'digest', words: 5 })) as { lines: string[] };
+  assert.ok(out.lines[0]!.includes('★to-you'), out.lines[0]);
+});
+
+// The server path (Claude Code channel server): a tools/call for a tool this server hides is answered by the agent, as an
+// error result that says how to turn it on, and nothing is fetched.
+function ccServer(opts: { digestView?: boolean }, history: PortalMessage[] = []) {
+  const { agent, fetches, client } = setup(opts, history);
+  const server = new PortalCcChannelServer(client, agent);
+  const responses: Array<{ content: Array<{ text: string }>; isError?: boolean }> = [];
+  (server as unknown as { conn: unknown }).conn = {
+    sendResponse(_id: number, result: unknown) { responses.push(result as never); },
+    sendError() {}, sendNotification() {}, async sendRequest() { return {}; },
+  };
+  const call = (name: string, args: Record<string, unknown>) =>
+    (server as unknown as { handleRequest(r: unknown): Promise<void> }).handleRequest({ id: 1, method: 'tools/call', params: { name, arguments: args } });
+  return { call, responses, fetches };
+}
+
+test('server path, off: a hidden fetch_message and a stray view each come back as an error result, and nothing is fetched', async () => {
+  await withEnv(undefined, async () => {
+    const { call, responses, fetches } = ccServer({}, [msg('hi')]);
+    await call('fetch_message', { messageId: 'rel-1' });
+    await call('fetch_history', { channelId: CHANNEL, view: 'digest' });
+    assert.equal(responses.length, 2);
+    assert.ok(responses.every((r) => r.isError === true));
+    assert.match(responses[0]!.content[0]!.text, /fetch_message is not enabled[\s\S]*PORTAL_DIGEST_VIEW=1/);
+    assert.match(responses[1]!.content[0]!.text, /digest view is not enabled[\s\S]*PORTAL_DIGEST_VIEW=1/);
+    assert.equal(fetches.length, 0);
+  });
+});
+
+test('server path, on: tools/call fetch_history with view digest answers with the digest', async () => {
+  const { call, responses } = ccServer({ digestView: true }, [msg('short one')]);
+  await call('fetch_history', { channelId: CHANNEL, view: 'digest' });
+  assert.equal(responses[0]!.isError, undefined);
+  assert.match(responses[0]!.content[0]!.text, /"view": "digest"[\s\S]*short one/);
 });

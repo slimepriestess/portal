@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { PortalMessage } from '@animalabs/portal-protocol';
-import { digestMessages, DigestCache, DEFAULT_DIGEST_WORDS, MAX_DIGEST_WORDS } from '../src/digest.js';
+import { digestMessages, DigestCache, RecentIds, DEFAULT_DIGEST_WORDS, MAX_DIGEST_WORDS, DIGEST_CHARS_PER_WORD } from '../src/digest.js';
 
 const ME = 'persona-me';
 const NO_MENTIONS = { personas: [], roles: [], users: [], everyone: false };
@@ -56,14 +56,14 @@ test('messages are numbered oldest first whatever order they arrive in', () => {
 test('a cut line says how much was cut and which message holds the rest', () => {
   const m = msg({ text: words(41) });
   const { lines } = digestMessages([m], { words: 30, selfPersonaId: ME });
-  assert.equal(lines[0]!.endsWith(`${words(30)}… (+11 words, full: ${m.nativeId})`), true, lines[0]);
+  assert.equal(lines[0]!.endsWith(`${words(30)}… (+11 words, full: ${m.id})`), true, lines[0]);
 });
 
 test('exactly the word limit is whole and one more is cut (the boundary)', () => {
   const at = digestMessages([msg({ text: words(30) })], { words: 30, selfPersonaId: ME }).lines[0]!;
   assert.ok(!at.includes('…') && at.endsWith('w30'), at);
   const over = digestMessages([msg({ text: words(31) })], { words: 30, selfPersonaId: ME }).lines[0]!;
-  assert.match(over, /w30… \(\+1 words, full: \d+\)$/);
+  assert.match(over, /w30… \(\+1 words, full: rel-\d+\)$/);
 });
 
 test('whitespace and newlines inside a message collapse to single spaces, so a line is one line', () => {
@@ -99,8 +99,67 @@ test('reactions show as emoji and count, attachments as a count', () => {
 test('a message that mentions the caller comes back whole, marked, however long', () => {
   const m = msg({ text: words(80), mentions: { ...NO_MENTIONS, personas: [ME] } });
   const line = digestMessages([m], { words: 5, selfPersonaId: ME }).lines[0]!;
-  assert.ok(line.includes('★mentions-you'), line);
+  assert.ok(line.includes('★to-you'), line);
   assert.ok(line.endsWith('w80') && !line.includes('…'), line);
+});
+
+test('every result carries the relay id of each message, in line order: an agent acts on a message by it', () => {
+  const late = msg({ text: 'second', at: '2026-10-20T15:00:00.000Z' });
+  const early = msg({ text: 'first', at: '2026-10-20T14:00:00.000Z' });
+  const { lines, ids } = digestMessages([late, early], { selfPersonaId: ME });
+  assert.deepEqual(ids, [early.id, late.id]);
+  assert.equal(ids.length, lines.length);
+});
+
+test('a cut line names the RELAY id (what react, reply, edit and the cursors take), not the snowflake', () => {
+  const m = msg({ text: words(40) });
+  const line = digestMessages([m], { words: 5, selfPersonaId: ME }).lines[0]!;
+  assert.ok(line.includes(`full: ${m.id})`) && !line.includes(m.nativeId), line);
+});
+
+test('what the persona wrote is never addressed to it, not even a reply to its own earlier message', () => {
+  const first = msg({ text: 'my first', who: persona(ME, 'me'), at: '2026-10-20T14:00:00.000Z' });
+  const follow = msg({ text: words(60), who: persona(ME, 'me'), at: '2026-10-20T14:01:00.000Z', replyToId: first.id, mentions: { ...NO_MENTIONS, personas: [ME] } });
+  const { lines } = digestMessages([first, follow], { words: 5, selfPersonaId: ME });
+  assert.ok(!lines[1]!.includes('★'), lines[1]);
+  assert.ok(lines[1]!.includes('… (+55 words'), lines[1]);
+});
+
+test('a reply to a message this persona wrote that is NOT in the batch counts, when its id is known', () => {
+  const known = new RecentIds();
+  known.add('rm_old_post');
+  const reply = msg({ text: words(60), replyToId: 'rm_old_post' });
+  const stranger = msg({ text: words(60), replyToId: 'rm_someone_elses' });
+  const { lines } = digestMessages([reply, stranger], { words: 5, selfPersonaId: ME, ownMessageIds: known });
+  const [a, b] = [lines.find((l) => l.includes('rm_old_post') || l.includes('★to-you')), lines.find((l) => !l.includes('★'))];
+  assert.ok(a!.includes('★to-you') && a!.endsWith('w60'), a);
+  assert.ok(b!.includes('… (+55 words'), b);
+});
+
+test('without the ids, the same reply is cut: a parent outside the batch is not seen', () => {
+  const reply = msg({ text: words(60), replyToId: 'rm_old_post' });
+  assert.ok(digestMessages([reply], { words: 5, selfPersonaId: ME }).lines[0]!.includes('… (+55 words'));
+});
+
+test('text with no spaces is bounded too: a long CJK line or a URL is cut by characters, and the marker says chars', () => {
+  const cjk = '日本語'.repeat(400);
+  const url = `https://example.com/${'a'.repeat(2000)}`;
+  const lines = digestMessages([msg({ text: cjk, at: '2026-10-20T14:00:00.000Z' }), msg({ text: url, at: '2026-10-20T14:01:00.000Z' })], { words: 10, selfPersonaId: ME }).lines;
+  const cap = 10 * DIGEST_CHARS_PER_WORD;
+  assert.match(lines[0]!, new RegExp(`… \\(\\+${cjk.length - cap} chars, full: rel-\\d+\\)$`));
+  assert.ok(lines[0]!.includes(cjk.slice(0, cap)) && !lines[0]!.includes(cjk.slice(0, cap + 1)));
+  assert.match(lines[1]!, /… \(\+\d+ chars, full: rel-\d+\)$/);
+  assert.ok(lines[1]!.length < url.length / 4, 'the line is far shorter than the text');
+});
+
+test('ordinary prose is still cut by words, and a short message is whole', () => {
+  const lines = digestMessages([msg({ text: words(40) }), msg({ text: 'ok' })], { words: 10, selfPersonaId: ME }).lines.join('\n');
+  assert.ok(lines.includes('(+30 words') && !lines.includes('chars'), lines);
+});
+
+test('a message addressed to the caller is whole even if it has no spaces and is very long', () => {
+  const m = msg({ text: 'x'.repeat(3000), mentions: { ...NO_MENTIONS, personas: [ME] } });
+  assert.ok(digestMessages([m], { words: 5, selfPersonaId: ME }).lines[0]!.endsWith('x'.repeat(3000)));
 });
 
 test('a mention of someone else is cut like any other message', () => {
@@ -113,7 +172,7 @@ test('a reply to the caller\'s own message counts as addressed to the caller', (
   const mine = msg({ text: 'my earlier post', who: persona(ME, 'me'), at: '2026-10-20T14:00:00.000Z' });
   const reply = msg({ text: words(60), at: '2026-10-20T14:01:00.000Z', replyToId: mine.id });
   const line = digestMessages([mine, reply], { words: 5, selfPersonaId: ME }).lines[1]!;
-  assert.ok(line.includes('★mentions-you') && line.endsWith('w60'), line);
+  assert.ok(line.includes('★to-you') && line.endsWith('w60'), line);
 });
 
 test('the message an addressed message replies to comes back whole too, marked', () => {
@@ -187,6 +246,34 @@ test('putting a message again refreshes it instead of keeping a copy', () => {
   assert.equal(cache.get(a.id), a, 'a was refreshed, so b is the one that goes');
   assert.equal(cache.get(b.id), undefined);
   assert.equal(cache.size, 2);
+});
+
+test('an edited message is refreshed in place, a deleted one is dropped, and one never shown is not added', () => {
+  const cache = new DigestCache(5);
+  const m = msg({ text: 'before' });
+  cache.put([m]);
+  const edited = { ...m, content: 'after', cleanContent: 'after' } as PortalMessage;
+  cache.refresh(edited);
+  assert.equal(cache.get(m.id)!.cleanContent, 'after');
+  assert.equal(cache.get(m.nativeId)!.cleanContent, 'after');
+  const never = msg({ text: 'x' });
+  cache.refresh(never);
+  assert.equal(cache.get(never.id), undefined);
+  assert.equal(cache.size, 1);
+  cache.drop(m.id);
+  assert.equal(cache.get(m.id), undefined);
+  assert.equal(cache.get(m.nativeId), undefined);
+  assert.doesNotThrow(() => cache.drop('never-there'));
+});
+
+test('RecentIds keeps the newest N ids', () => {
+  const r = new RecentIds(3);
+  for (const id of ['a', 'b', 'c', 'd']) r.add(id);
+  assert.equal(r.size, 3);
+  assert.equal(r.has('a'), false);
+  assert.ok(r.has('b') && r.has('c') && r.has('d'));
+  r.add('b'); r.add('e');
+  assert.ok(r.has('b') && !r.has('c'), 'adding again refreshes');
 });
 
 test('the default cache bound is the one the docs state', () => {

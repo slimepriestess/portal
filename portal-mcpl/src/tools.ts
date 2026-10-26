@@ -212,21 +212,6 @@ const definitions: ToolDefinition[] = [
     },
   },
   {
-    name: 'fetch_message',
-    description:
-      'Read one message in full, by relay id or Discord snowflake: the message a digest cut short ' +
-      '(fetch_history or fetch_around with view "digest" prints "full: <id>" on every cut line). Serves only ' +
-      'messages a digest has shown this server recently; for any other, fetch it again with fetch_history or ' +
-      'fetch_around. Offered only where the server has turned the digest view on.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        messageId: { type: 'string', description: 'Relay message id or Discord snowflake, as a digest line prints it' },
-      },
-      required: ['messageId'],
-    },
-  },
-  {
     name: 'list_guilds',
     description: 'List the guilds (servers) visible to the relay.',
     inputSchema: { type: 'object', properties: {} },
@@ -435,6 +420,26 @@ const definitions: ToolDefinition[] = [
   },
 ];
 
+/** Tools that exist only while the digest view is on (agent.ts). Kept out of `toolDefinitions`, which stays the
+ *  surface a server without the view offers, so a host that serves it directly serves exactly that. */
+const digestOnlyDefinitions: ToolDefinition[] = [
+  {
+    name: 'fetch_message',
+    description:
+      'Read one message in full, by relay id or Discord snowflake: the message a digest cut short ' +
+      '(fetch_history or fetch_around with view "digest" prints "full: <id>" on every cut line). Serves only ' +
+      'messages a digest has shown this server recently; for any other, fetch it again with fetch_history or ' +
+      'fetch_around. Offered only where the server has turned the digest view on.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        messageId: { type: 'string', description: 'Relay message id or Discord snowflake, as a digest line prints it' },
+      },
+      required: ['messageId'],
+    },
+  },
+];
+
 /** The names the digest view adds a property to. */
 const DIGEST_VIEW_TOOLS = new Set(['fetch_history', 'fetch_around']);
 
@@ -470,3 +475,6 @@ export function withDigestView(tool: ToolDefinition): ToolDefinition {
  * Claude Code channel — serve these objects via `PortalAgent.tools`.
  */
 export const toolDefinitions: ToolDefinition[] = definitions.map(withToolClass);
+
+/** What the digest view adds to the served surface when it is on: `fetch_message`. Classed like the rest. */
+export const digestToolDefinitions: ToolDefinition[] = digestOnlyDefinitions.map(withToolClass);

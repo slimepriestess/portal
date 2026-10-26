@@ -6,7 +6,9 @@
  * read-state is AgentState's; this class is the glue + the tool dispatch table.
  *
  * The remaining integration seam is binding this to an McplConnection (from
- * @animalabs/mcpl-core): forward tools/list → `toolDefinitions`, tools/call →
+ * @animalabs/mcpl-core): forward tools/list → `agent.tools` (the surface this
+ * agent serves: `toolDefinitions` less what the host retires, plus the digest
+ * view's `fetch_message` and `view`/`words` when it is on), tools/call →
  * `handleToolCall`, and emit a PUSH_EVENT whenever `onPing` fires. That binding
  * is intentionally not done here so this package stays transport-agnostic and
  * unit-testable. See README for the ~30-line adapter sketch.
@@ -23,8 +25,8 @@ import {
   type ResolveResult,
 } from './channel-names.js';
 import { chunkText } from './chunk.js';
-import { toolDefinitions, withDigestView } from './tools.js';
-import { DigestCache, checkedWords, digestMessages } from './digest.js';
+import { digestToolDefinitions, toolDefinitions, withDigestView } from './tools.js';
+import { DigestCache, RecentIds, checkedWords, digestMessages } from './digest.js';
 import { resolveOutgoingFiles, type ResolveFilesOptions } from './files.js';
 
 /**
@@ -48,12 +50,12 @@ const RETIRED_WHEN_HOST_OWNS_CHANNELS: Readonly<Record<string, string>> = {
     'own channel tools, such as channel_open and channel_close.',
 };
 
-/** Tools served only while the digest view is on. */
-const DIGEST_ONLY_TOOLS: ReadonlySet<string> = new Set(['fetch_message']);
-
 const DIGEST_NOTE =
-  'Numbered oldest first. A line ending "(+N words, full: ID)" was cut: fetch_message with that ID returns the ' +
-  'whole message. Lines marked ★ are whole because they are addressed to you or are what an addressed message replies to.';
+  'Numbered oldest first; times are UTC (month-day hour:minute). ids[N-1] is the relay id of #N: use it to react, ' +
+  'reply, edit, or page from that message. A line ending "(+N words, full: ID)" or "(+N chars, full: ID)" was cut: ' +
+  'fetch_message with that ID returns the whole message as the digest saw it, updated if it was edited and gone if it ' +
+  'was deleted while this server was listening. Lines marked ★ are whole because they are addressed to you (★to-you) ' +
+  'or are what an addressed message replies to (★replied-to).';
 
 /** PORTAL_DIGEST_VIEW=1 (or true) turns the digest view on at this server. Anything else leaves it off. */
 function digestViewFromEnv(): boolean {
@@ -89,6 +91,8 @@ export class PortalAgent {
   private onPublicActivity?: (kind: 'message' | 'reaction' | 'edit') => void;
   private readonly digestView: boolean;
   private readonly digestCache = new DigestCache();
+  /** Relay ids of messages this persona wrote that this process has seen: what it sent, and what a digest showed. */
+  private readonly ownMessageIds = new RecentIds();
 
   constructor(
     private client: PortalClient,
@@ -104,7 +108,9 @@ export class PortalAgent {
     this.client.on('messageUpdate', (e) => {
       // An edit to a message we track refreshes its preview but isn't a new ping.
       this.state.ingest(e.message, false, e.reasons);
+      this.digestCache.refresh(e.message);
     });
+    this.client.on('messageDelete', (e) => this.digestCache.drop(e.messageId));
     // The client asks the relay for its subscriptions again on every
     // reconnect, a resume included. Standalone, it's built with this durable
     // state (session.ts) and each change below goes to both, a voice_join's
@@ -144,10 +150,11 @@ export class PortalAgent {
   }
 
   get tools(): typeof toolDefinitions {
-    return toolDefinitions
-      .filter((tool) => !(this.hostOwnsChannelLifecycle && Object.hasOwn(RETIRED_WHEN_HOST_OWNS_CHANNELS, tool.name)))
-      .filter((tool) => this.digestView || !DIGEST_ONLY_TOOLS.has(tool.name))
-      .map((tool) => (this.digestView ? withDigestView(tool) : tool));
+    const base = toolDefinitions.filter(
+      (tool) => !(this.hostOwnsChannelLifecycle && Object.hasOwn(RETIRED_WHEN_HOST_OWNS_CHANNELS, tool.name)),
+    );
+    if (!this.digestView) return base;
+    return [...base.map(withDigestView), ...digestToolDefinitions];
   }
 
   /** While the digest view is off, a call that asks for any of it is refused before a fetch, a channel lookup or
@@ -187,9 +194,11 @@ export class PortalAgent {
 
   /** The digest of a fetch's messages, and the cache `fetch_message` reads them back from. */
   private digestOf(messages: readonly PortalMessage[], words: number | undefined): unknown {
-    const { lines, ordered } = digestMessages(messages, { words, selfPersonaId: this.client.personaId });
+    const self = this.client.personaId;
+    for (const m of messages) if (m.author.kind === 'persona' && m.author.personaId === self) this.ownMessageIds.add(m.id);
+    const { lines, ids, ordered } = digestMessages(messages, { words, selfPersonaId: self, ownMessageIds: this.ownMessageIds });
     this.digestCache.put(ordered);
-    return { view: 'digest', count: lines.length, note: DIGEST_NOTE, lines };
+    return { view: 'digest', count: lines.length, note: DIGEST_NOTE, ids, lines };
   }
 
   /** Server-authoritative pending pings, including any accrued while this
@@ -245,7 +254,7 @@ export class PortalAgent {
     if (this.hostOwnsChannelLifecycle && Object.hasOwn(RETIRED_WHEN_HOST_OWNS_CHANNELS, name)) {
       throw new Error(RETIRED_WHEN_HOST_OWNS_CHANNELS[name]);
     }
-    if (!toolDefinitions.some((tool) => tool.name === name)) {
+    if (!toolDefinitions.some((tool) => tool.name === name) && !digestToolDefinitions.some((tool) => tool.name === name)) {
       throw new Error(unknownToolMessage(name));
     }
     this.refuseDigestWhileOff(name, args);
@@ -328,7 +337,10 @@ export class PortalAgent {
             );
           }
           const id = (result as { messageId?: unknown } | undefined)?.messageId;
-          if (typeof id === 'string') posted.push(id);
+          if (typeof id === 'string') {
+            posted.push(id);
+            this.ownMessageIds.add(id);
+          }
           first ??= result;
         }
         this.onPublicActivity?.('message');

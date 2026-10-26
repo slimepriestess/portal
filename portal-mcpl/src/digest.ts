@@ -8,25 +8,38 @@
  * the message an addressed message replies to.
  *
  * "Addressed to it" is derived from what a history message carries. The relay works out addressedToMe only for live
- * events, so here it is: the message mentions this persona (mentions.personas), or replies to a message in the same
- * batch that this persona wrote. A name typed in the text without a mention, a role mention the relay did not resolve to
- * this persona, and a reply to a message outside the batch are not seen.
+ * events, so here it is: another author's message that mentions this persona (mentions.personas), or replies to a
+ * message this persona wrote, found in the same batch or among the ids it is known to have written (sent by this
+ * server, or shown by an earlier digest). The persona's own messages are never addressed to it. A name typed
+ * in the text without a mention, a role mention the relay did not resolve to this persona, and a reply to a message
+ * outside the batch that this server never sent nor showed are not seen.
+ *
+ * Every result carries the relay id of each message, in line order, because an agent acts on a message (reply, react,
+ * edit, page from it) by its relay id and never by a snowflake, and a digest it cannot act on is only half useful.
  */
 import type { PortalMessage } from '@animalabs/portal-protocol';
 
 export const DEFAULT_DIGEST_WORDS = 30;
 export const MAX_DIGEST_WORDS = 500;
 export const DEFAULT_DIGEST_CACHE = 500;
+/** A cut line keeps at most this many characters per word of the limit, so text with no spaces (CJK, a long URL, code)
+ *  is bounded too. 12 is a generous English word with its space. */
+export const DIGEST_CHARS_PER_WORD = 12;
 
 export interface DigestOptions {
   /** Words kept of each cut message (default 30, 1 to 500). */
   words?: number;
   /** This agent's own persona id: what "addressed to me" means. */
   selfPersonaId?: string;
+  /** Relay ids of messages this persona is known to have written (RecentIds), so a reply to one of them counts as
+   *  addressed to it even when the message it answers is outside the batch. */
+  ownMessageIds?: { has(id: string): boolean };
 }
 
 export interface DigestResult {
   lines: string[];
+  /** The relay id of each message, in line order: ids[N - 1] is the id of #N. */
+  ids: string[];
   /** The messages in digest order (oldest first), so a caller can cache what the lines stand for. */
   ordered: PortalMessage[];
 }
@@ -65,8 +78,12 @@ export function digestMessages(messages: readonly PortalMessage[], opts: DigestO
   const addressed = new Set<string>();
   if (self !== undefined) {
     for (const m of ordered) {
+      // What this persona wrote is never addressed to it, even as a reply to its own earlier message.
+      if (m.author.kind === 'persona' && m.author.personaId === self) continue;
       const parent = m.replyToId ? byId.get(m.replyToId) : undefined;
-      const repliesToMe = parent !== undefined && parent.author.kind === 'persona' && parent.author.personaId === self;
+      const repliesToMe =
+        (parent !== undefined && parent.author.kind === 'persona' && parent.author.personaId === self) ||
+        (m.replyToId !== undefined && opts.ownMessageIds?.has(m.replyToId) === true);
       if (m.mentions.personas.includes(self) || repliesToMe) addressed.add(m.id);
     }
   }
@@ -81,14 +98,41 @@ export function digestMessages(messages: readonly PortalMessage[], opts: DigestO
     const text = (m.cleanContent ?? m.content ?? '').trim().replace(/\s+/g, ' ');
     const all = text === '' ? [] : text.split(' ');
     const whole = addressed.has(m.id) || repliedTo.has(m.id);
-    const body = whole || all.length <= limit ? text : `${all.slice(0, limit).join(' ')}… (+${all.length - limit} words, full: ${m.nativeId})`;
+    const cap = limit * DIGEST_CHARS_PER_WORD;
+    const byWords = all.slice(0, limit).join(' ');
+    let body = text;
+    if (!whole) {
+      if (byWords.length > cap) body = `${text.slice(0, cap)}… (+${text.length - cap} chars, full: ${m.id})`;
+      else if (all.length > limit) body = `${byWords}… (+${all.length - limit} words, full: ${m.id})`;
+    }
     const reply = m.replyToId ? ` ↩${ordinal.has(m.replyToId) ? `#${ordinal.get(m.replyToId)}` : '(not in batch)'}` : '';
     const reactions = m.reactions.map((r) => ` ${emojiLabel(r.emoji)}${r.count}`).join('');
     const attached = m.attachments.length > 0 ? ` 📎${m.attachments.length}` : '';
-    const mark = addressed.has(m.id) ? ' ★mentions-you' : repliedTo.has(m.id) ? ' ★replied-to' : '';
+    const mark = addressed.has(m.id) ? ' ★to-you' : repliedTo.has(m.id) ? ' ★replied-to' : '';
     return `#${i + 1} ${when(m)} ${who(m)}${reply}${reactions}${attached}${mark}: ${body}`;
   });
-  return { lines, ordered };
+  return { lines, ids: ordered.map((m) => m.id), ordered };
+}
+
+/** A bounded set of ids, newest kept: the relay ids of messages this persona is known to have written. */
+export class RecentIds {
+  private readonly ids = new Set<string>();
+
+  constructor(readonly capacity: number = 2000) {}
+
+  get size(): number {
+    return this.ids.size;
+  }
+
+  add(id: string): void {
+    this.ids.delete(id);
+    this.ids.add(id);
+    while (this.ids.size > this.capacity) this.ids.delete(this.ids.values().next().value as string);
+  }
+
+  has(id: string): boolean {
+    return this.ids.has(id);
+  }
 }
 
 /**
@@ -118,6 +162,19 @@ export class DigestCache {
       this.byId.delete(oldest);
       this.nativeToId.delete(gone.nativeId);
     }
+  }
+
+  /** A message the cache holds was edited: keep it where it is, with its new content. A message it does not hold is not added. */
+  refresh(message: PortalMessage): void {
+    if (this.byId.has(message.id)) this.byId.set(message.id, message);
+  }
+
+  /** A message was deleted: it is not served again. */
+  drop(id: string): void {
+    const gone = this.byId.get(id);
+    if (!gone) return;
+    this.byId.delete(id);
+    this.nativeToId.delete(gone.nativeId);
   }
 
   get(ref: string): PortalMessage | undefined {
