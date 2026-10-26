@@ -159,9 +159,9 @@ test('MCPL server tools/list emits mcpl/class and keeps existing _meta (host-own
   assert.ok(tools.length > 0);
 });
 
-test('Claude Code channel tools/list emits mcpl/class and keeps existing _meta (full surface)', async () => {
+test('Claude Code channel tools/list emits mcpl/class and keeps existing _meta (full surface, digest view on)', async () => {
   const client = new PortalClient({ url: 'ws://test', token: 't', personaId: 'p' });
-  const server = new PortalCcChannelServer(client, new AttributedAgent(client));
+  const server = new PortalCcChannelServer(client, new AttributedAgent(client, { digestView: true }));
   const internal = server as unknown as Internal;
   const stub = connStub();
   internal.conn = stub.conn;
@@ -170,4 +170,23 @@ test('Claude Code channel tools/list emits mcpl/class and keeps existing _meta (
   assert.equal(stub.errors.length, 0);
   const { tools } = stub.responses[0] as { tools: ToolDefinition[] };
   assertClassedListing(tools, toolDefinitions.map((t) => t.name));
+});
+
+test('Claude Code channel tools/list by default leaves out only what the digest view adds (portal#79)', async () => {
+  const client = new PortalClient({ url: 'ws://test', token: 't', personaId: 'p' });
+  // The environment must not turn the view on for a test of the default.
+  const saved = process.env.PORTAL_DIGEST_VIEW;
+  delete process.env.PORTAL_DIGEST_VIEW;
+  try {
+    const server = new PortalCcChannelServer(client, new AttributedAgent(client));
+    const internal = server as unknown as Internal;
+    const stub = connStub();
+    internal.conn = stub.conn;
+    await internal.handleRequest({ id: 1, method: 'tools/list' });
+    assert.equal(stub.errors.length, 0);
+    const { tools } = stub.responses[0] as { tools: ToolDefinition[] };
+    assertClassedListing(tools, toolDefinitions.map((t) => t.name).filter((name) => name !== 'fetch_message'));
+  } finally {
+    if (saved !== undefined) process.env.PORTAL_DIGEST_VIEW = saved;
+  }
 });
