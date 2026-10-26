@@ -212,6 +212,21 @@ const definitions: ToolDefinition[] = [
     },
   },
   {
+    name: 'fetch_message',
+    description:
+      'Read one message in full, by relay id or Discord snowflake: the message a digest cut short ' +
+      '(fetch_history or fetch_around with view "digest" prints "full: <id>" on every cut line). Serves only ' +
+      'messages a digest has shown this server recently; for any other, fetch it again with fetch_history or ' +
+      'fetch_around. Offered only where the server has turned the digest view on.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        messageId: { type: 'string', description: 'Relay message id or Discord snowflake, as a digest line prints it' },
+      },
+      required: ['messageId'],
+    },
+  },
+  {
     name: 'list_guilds',
     description: 'List the guilds (servers) visible to the relay.',
     inputSchema: { type: 'object', properties: {} },
@@ -419,6 +434,35 @@ const definitions: ToolDefinition[] = [
     },
   },
 ];
+
+/** The names the digest view adds a property to. */
+const DIGEST_VIEW_TOOLS = new Set(['fetch_history', 'fetch_around']);
+
+/** What a tool offers once the server has turned the digest view on (agent.ts): `view` and `words` on the two history
+ *  fetches. Off, the static definitions are served exactly as they are above, with none of this. */
+export function withDigestView(tool: ToolDefinition): ToolDefinition {
+  if (!DIGEST_VIEW_TOOLS.has(tool.name)) return tool;
+  return {
+    ...tool,
+    description:
+      `${tool.description} With view "digest" it returns one line per message instead of the whole objects ` +
+      '(time, author, reply marker, reactions, attachments, then the first `words` words); a cut line says how many ' +
+      'words it lost and prints "full: <id>" for fetch_message, and a message addressed to you comes back whole. ' +
+      'Default view is "full", as before.',
+    inputSchema: {
+      ...tool.inputSchema,
+      properties: {
+        ...tool.inputSchema.properties,
+        view: {
+          type: 'string',
+          enum: ['full', 'digest'],
+          description: '"full" (default) returns the whole message objects; "digest" returns one short line per message.',
+        },
+        words: { type: 'number', description: 'With view "digest": words kept of each cut message (default 30, 1 to 500).' },
+      },
+    },
+  };
+}
 
 /**
  * The served tool surface. Every definition carries its MCPL RFC-008 class in

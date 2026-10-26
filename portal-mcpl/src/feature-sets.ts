@@ -146,6 +146,7 @@ export const TOOL_FEATURE_SETS: Readonly<Record<string, string>> = {
 
   fetch_history: 'portal.history',
   fetch_around: 'portal.history',
+  fetch_message: 'portal.history',
   list_pins: 'portal.history',
 
   voice_join: 'portal.voice',
