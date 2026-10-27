@@ -427,9 +427,11 @@ const digestOnlyDefinitions: ToolDefinition[] = [
     name: 'fetch_message',
     description:
       'Read one message in full, by relay id or Discord snowflake: the message a digest cut short ' +
-      '(fetch_history or fetch_around with view "digest" prints "full: <id>" on every cut line). Serves only ' +
-      'messages a digest has shown this server recently; for any other, fetch it again with fetch_history or ' +
-      'fetch_around. Offered only where the server has turned the digest view on.',
+      '(fetch_history or fetch_around with view "digest" prints "full: <id>" on every cut line). It reads the ' +
+      'message from the relay now, so it shows edits and reactions as they are, and is refused if the message is gone ' +
+      'or you can no longer read the channel. Works only for messages a digest has shown this server recently; for ' +
+      'any other, fetch it again with fetch_history or fetch_around. Offered only where the server has turned the ' +
+      'digest view on.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -463,7 +465,7 @@ export function withDigestView(tool: ToolDefinition): ToolDefinition {
           enum: ['full', 'digest'],
           description: '"full" (default) returns the whole message objects; "digest" returns one short line per message.',
         },
-        words: { type: 'number', description: 'With view "digest": words kept of each cut message (default 30, 1 to 500).' },
+        words: { type: 'integer', minimum: 1, maximum: 500, description: 'With view "digest": words kept of each cut message (default 30).' },
       },
     },
   };

@@ -375,7 +375,7 @@ test('R1-5: the package exports what a host that builds its own tools/list needs
 
 test('R1-6: past the remembered-ids bound it is the OLDEST own posts that are forgotten, not the newest', async () => {
   const mine = Array.from({ length: 2100 }, (_, i) => msg(`own post ${i}`, {
-    who: { kind: 'persona', personaId: 'persona-me', displayName: 'me', avatarUrl: '' },
+    author: { kind: 'persona', personaId: 'persona-me', displayName: 'me', avatarUrl: '' },
     createdAt: new Date(Date.UTC(2026, 9, 20, 0, 0, 0) + i * 1000).toISOString(),
   }));
   const newestFirst = [...mine].reverse();                   // the relay returns history newest-first

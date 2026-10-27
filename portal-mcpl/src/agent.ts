@@ -26,7 +26,7 @@ import {
 } from './channel-names.js';
 import { chunkText } from './chunk.js';
 import { digestToolDefinitions, toolDefinitions, withDigestView } from './tools.js';
-import { DigestCache, RecentIds, checkedWords, digestMessages } from './digest.js';
+import { DigestIndex, RecentIds, checkedWords, digestMessages } from './digest.js';
 import { resolveOutgoingFiles, type ResolveFilesOptions } from './files.js';
 
 /**
@@ -53,9 +53,10 @@ const RETIRED_WHEN_HOST_OWNS_CHANNELS: Readonly<Record<string, string>> = {
 const DIGEST_NOTE =
   'Numbered oldest first; times are UTC (month-day hour:minute). ids[N-1] is the relay id of #N: use it to react, ' +
   'reply, edit, or page from that message. A line ending "(+N words, full: ID)" or "(+N chars, full: ID)" was cut: ' +
-  'fetch_message with that ID returns the whole message as the digest saw it, updated if it was edited and gone if it ' +
-  'was deleted while this server was listening. Lines marked ★ are whole because they are addressed to you (★to-you) ' +
-  'or are what an addressed message replies to (★replied-to).';
+  'fetch_message with that ID reads the message from the relay now, so it shows edits and reactions as they are, and ' +
+  'says so if the message is gone or you can no longer read it. A line with no cut marker is the whole message and ' +
+  'keeps its own line breaks. Lines marked ★ are whole because they are addressed to you (★to-you) or are what an ' +
+  'addressed message replies to (★replied-to).';
 
 /** PORTAL_DIGEST_VIEW=1 (or true) turns the digest view on at this server. Anything else leaves it off. */
 function digestViewFromEnv(): boolean {
@@ -90,7 +91,8 @@ export class PortalAgent {
   private fileOpts: ResolveFilesOptions;
   private onPublicActivity?: (kind: 'message' | 'reaction' | 'edit') => void;
   private readonly digestView: boolean;
-  private readonly digestCache = new DigestCache();
+  /** Where the messages a digest showed live, for fetch_message to read again. No content. */
+  private readonly digestIndex = new DigestIndex();
   /** Relay ids of messages this persona wrote that this process has seen: what it sent, and what a digest showed. */
   private readonly ownMessageIds = new RecentIds();
 
@@ -108,9 +110,7 @@ export class PortalAgent {
     this.client.on('messageUpdate', (e) => {
       // An edit to a message we track refreshes its preview but isn't a new ping.
       this.state.ingest(e.message, false, e.reasons);
-      this.digestCache.refresh(e.message);
     });
-    this.client.on('messageDelete', (e) => this.digestCache.drop(e.messageId));
     // The client asks the relay for its subscriptions again on every
     // reconnect, a resume included. Standalone, it's built with this durable
     // state (session.ts) and each change below goes to both, a voice_join's
@@ -195,9 +195,10 @@ export class PortalAgent {
   /** The digest of a fetch's messages, and the cache `fetch_message` reads them back from. */
   private digestOf(messages: readonly PortalMessage[], words: number | undefined): unknown {
     const self = this.client.personaId;
-    for (const m of messages) if (m.author.kind === 'persona' && m.author.personaId === self) this.ownMessageIds.add(m.id);
     const { lines, ids, ordered } = digestMessages(messages, { words, selfPersonaId: self, ownMessageIds: this.ownMessageIds });
-    this.digestCache.put(ordered);
+    // Oldest first, so that past the bound it is the oldest ids that are forgotten, whatever order the relay returned them in.
+    for (const m of ordered) if (m.author.kind === 'persona' && m.author.personaId === self) this.ownMessageIds.add(m.id);
+    this.digestIndex.put(ordered);
     return { view: 'digest', count: lines.length, note: DIGEST_NOTE, ids, lines };
   }
 
@@ -388,14 +389,31 @@ export class PortalAgent {
       }
       case 'fetch_message': {
         const ref = str(args.messageId, 'messageId');
-        const message = this.digestCache.get(ref);
-        if (!message) {
+        const place = this.digestIndex.get(ref);
+        if (!place) {
           throw new Error(
-            `Nothing ran: ${shortJson(ref)} isn't in this server's digest cache. It keeps the last ${this.digestCache.capacity} ` +
-              'messages a digest has shown, and starts empty after a restart. Fetch it again with fetch_history or fetch_around.',
+            `Nothing ran: ${shortJson(ref)} isn't one this server has shown in a digest. It remembers where the last ${this.digestIndex.capacity} ` +
+              'messages a digest showed are, and starts empty after a restart. Fetch it again with fetch_history or fetch_around.',
           );
         }
-        return { message };
+        // A live read, so what comes back is what the relay says now: edits and reactions as they are, and a refusal
+        // if the agent can no longer read the channel. `before` is an exclusive snowflake cursor and history pages
+        // newest-first, so the first message before the snowflake plus one is this message if it still exists.
+        if (!/^\d+$/.test(place.nativeId)) throw new Error(`Nothing ran: ${shortJson(ref)} has no snowflake to read it by. Fetch it again with fetch_history.`);
+        const page = await this.client.fetchHistory({
+          channelId: place.channelId,
+          threadId: place.threadId,
+          before: String(BigInt(place.nativeId) + 1n),
+          limit: 1,
+        });
+        const found = page.messages[0];
+        if (!found || found.nativeId !== place.nativeId) {
+          throw new Error(
+            `Nothing ran: ${shortJson(ref)} is no longer there: it was deleted, or you can no longer read it. ` +
+              'fetch_history shows what the channel holds now.',
+          );
+        }
+        return { message: found };
       }
       case 'list_guilds':
         return this.client.call('list_guilds', {});

@@ -196,6 +196,12 @@ test('R1-1: a lone surrogate that arrives in the source text is replaced, so no 
   assert.ok(line.includes('before \ufffd after'), JSON.stringify(line));
 });
 
+test('R1-1: a lone LOW surrogate in the source is replaced too, and a proper pair next to lone halves is kept', () => {
+  const line = digestMessages([msg({ text: 'x \ude00 y 😀 z \ud83d' })], { selfPersonaId: ME }).lines[0]!;
+  assert.ok(!LONE.test(line), JSON.stringify(line));
+  assert.ok(line.endsWith(': x \ufffd y 😀 z \ufffd'), JSON.stringify(line));
+});
+
 test('ordinary prose is still cut by words, and a short message is whole', () => {
   const lines = digestMessages([msg({ text: words(40) }), msg({ text: 'ok' })], { words: 10, selfPersonaId: ME }).lines.join('\n');
   assert.ok(lines.includes('(+30 words') && !lines.includes('chars'), lines);
@@ -246,7 +252,7 @@ test('R1-4: in a long reply chain with the agent, only the replies to it are who
   }
   const lines = digestMessages(chain, { words: 5, selfPersonaId: ME }).lines;
   const whole = lines.filter((l) => !l.includes('… (+')).length;
-  assert.equal(whole, 5, `only the five replies to the agent are whole:\n${lines.join('\n')}`);
+  assert.equal(whole, 4, `only the four replies to the agent are whole (#3 #5 #7 #9), none of its own posts:\n${lines.join('\n')}`);
 });
 
 test('a message that replies to someone else\'s unaddressed message pulls nothing whole', () => {

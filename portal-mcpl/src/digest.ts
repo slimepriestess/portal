@@ -14,6 +14,11 @@
  * in the text without a mention, a role mention the relay did not resolve to this persona, and a reply to a message
  * outside the batch that this server never sent nor showed are not seen.
  *
+ * A message shown whole keeps its own line breaks and indentation; only a message that is cut is flattened to one
+ * line. A cut never lands inside a character: it falls on a boundary a person would see (an emoji, a flag or a joined
+ * family is kept or dropped whole), and a lone surrogate in the source is replaced, because the Anthropic API refuses
+ * a request body that contains one and a line that carried one would fail every later request in that context.
+ *
  * Every result carries the relay id of each message, in line order, because an agent acts on a message (reply, react,
  * edit, page from it) by its relay id and never by a snowflake, and a digest it cannot act on is only half useful.
  */
@@ -53,6 +58,12 @@ export function checkedWords(value: number | undefined): number {
   return value;
 }
 
+/** Lone surrogate halves become U+FFFD: JSON.stringify writes them as escapes and the API refuses the request. */
+const wellFormed = (s: string): string => s.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, '\ufffd');
+
+const segmenter = new Intl.Segmenter('en', { granularity: 'grapheme' });
+const graphemesOf = (s: string): string[] => [...segmenter.segment(s)].map((part) => part.segment);
+
 const when = (m: PortalMessage): string => m.createdAt.slice(5, 16).replace('T', ' ');
 
 function who(m: PortalMessage): string {
@@ -87,23 +98,34 @@ export function digestMessages(messages: readonly PortalMessage[], opts: DigestO
       if (m.mentions.personas.includes(self) || repliesToMe) addressed.add(m.id);
     }
   }
-  // The message an addressed message answers is read with it, so the question stays beside the ping.
+  // The message an addressed message answers is read with it, so the question stays beside the ping. Not the agent's
+  // own post: a reply to the agent would only bring its own words back, whole, in every conversation it is part of.
   const repliedTo = new Set<string>();
   for (const id of addressed) {
     const replyToId = byId.get(id)?.replyToId;
-    if (replyToId !== undefined && byId.has(replyToId) && !addressed.has(replyToId)) repliedTo.add(replyToId);
+    const parent = replyToId === undefined ? undefined : byId.get(replyToId);
+    const own = parent !== undefined && parent.author.kind === 'persona' && parent.author.personaId === self;
+    if (parent !== undefined && !own && !addressed.has(parent.id)) repliedTo.add(parent.id);
   }
 
   const lines = ordered.map((m, i) => {
-    const text = (m.cleanContent ?? m.content ?? '').trim().replace(/\s+/g, ' ');
-    const all = text === '' ? [] : text.split(' ');
+    const original = wellFormed((m.cleanContent ?? m.content ?? '').trim());
+    const flat = original.replace(/\s+/g, ' ');
+    const all = flat === '' ? [] : flat.split(' ');
     const whole = addressed.has(m.id) || repliedTo.has(m.id);
     const cap = limit * DIGEST_CHARS_PER_WORD;
     const byWords = all.slice(0, limit).join(' ');
-    let body = text;
+    // A message shown whole is shown as written, line breaks and indentation included: for code, lists and quoted
+    // text a flattened copy can say something else. Only a cut message is flattened.
+    let body = original;
     if (!whole) {
-      if (byWords.length > cap) body = `${text.slice(0, cap)}… (+${text.length - cap} chars, full: ${m.id})`;
-      else if (all.length > limit) body = `${byWords}… (+${all.length - limit} words, full: ${m.id})`;
+      // UTF-16 length is never less than the character count, so only text that long is segmented.
+      const characters = byWords.length > cap ? graphemesOf(flat) : undefined;
+      if (characters !== undefined && graphemesOf(byWords).length > cap) {
+        body = `${characters.slice(0, cap).join('')}… (+${characters.length - cap} chars, full: ${m.id})`;
+      } else if (all.length > limit) {
+        body = `${byWords}… (+${all.length - limit} words, full: ${m.id})`;
+      }
     }
     const reply = m.replyToId ? ` ↩${ordinal.has(m.replyToId) ? `#${ordinal.get(m.replyToId)}` : '(not in batch)'}` : '';
     const reactions = m.reactions.map((r) => ` ${emojiLabel(r.emoji)}${r.count}`).join('');
@@ -135,12 +157,22 @@ export class RecentIds {
   }
 }
 
+/** Where a message lives: enough to read it from the relay again. Never its content. */
+export interface MessageLocation {
+  id: string;
+  nativeId: string;
+  channelId: string;
+  threadId?: string;
+}
+
 /**
- * The last messages a digest showed, by relay id and by snowflake, for `fetch_message`. Bounded: the newest `capacity`
- * stay and the oldest go. It lives in this process only, so a restart empties it and a miss says so.
+ * Where the last messages a digest showed live, by relay id and by snowflake, for `fetch_message`, which reads the
+ * message from the relay again. It keeps no text, so it cannot go stale, and it cannot serve what the agent has since
+ * lost the right to read. Bounded: the newest `capacity` stay and the oldest go. It lives in this process only, so a
+ * restart empties it and a miss says so.
  */
-export class DigestCache {
-  private readonly byId = new Map<string, PortalMessage>();
+export class DigestIndex {
+  private readonly byId = new Map<string, MessageLocation>();
   private readonly nativeToId = new Map<string, string>();
 
   constructor(readonly capacity: number = DEFAULT_DIGEST_CACHE) {}
@@ -153,7 +185,7 @@ export class DigestCache {
     for (const m of messages) {
       // Insertion order is recency: a message shown again moves to the newest end.
       this.byId.delete(m.id);
-      this.byId.set(m.id, m);
+      this.byId.set(m.id, { id: m.id, nativeId: m.nativeId, channelId: m.channelId, ...(m.threadId !== undefined ? { threadId: m.threadId } : {}) });
       this.nativeToId.set(m.nativeId, m.id);
     }
     while (this.byId.size > this.capacity) {
@@ -164,20 +196,7 @@ export class DigestCache {
     }
   }
 
-  /** A message the cache holds was edited: keep it where it is, with its new content. A message it does not hold is not added. */
-  refresh(message: PortalMessage): void {
-    if (this.byId.has(message.id)) this.byId.set(message.id, message);
-  }
-
-  /** A message was deleted: it is not served again. */
-  drop(id: string): void {
-    const gone = this.byId.get(id);
-    if (!gone) return;
-    this.byId.delete(id);
-    this.nativeToId.delete(gone.nativeId);
-  }
-
-  get(ref: string): PortalMessage | undefined {
+  get(ref: string): MessageLocation | undefined {
     return this.byId.get(ref) ?? this.byId.get(this.nativeToId.get(ref) ?? '');
   }
 }
