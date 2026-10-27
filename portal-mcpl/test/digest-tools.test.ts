@@ -158,6 +158,7 @@ test('on: view "digest" returns one line per message, a note, and asks the relay
   assert.ok(out.lines[1]!.endsWith(': short one'));
   assert.match(out.note, /fetch_message/);
   assert.match(out.note, /UTC/);
+  assert.match(out.note, /reads the message from the relay now/, 'the note promises a live read, and fetch_message keeps the promise');
   assert.deepEqual(out.ids, history.map((m) => m.id).sort((a, b) => (history.find((x) => x.id === a)!.createdAt < history.find((x) => x.id === b)!.createdAt ? -1 : 1)));
   assert.equal(fetches.length, 1);
   assert.equal(fetches[0]!.limit, 2, 'the page size is the caller\'s, not changed by the view');
@@ -212,13 +213,14 @@ test('R1-2: an edit is seen with no event: the relay\'s answer is the message, r
 });
 
 test('R1-2: a message the relay no longer has is reported gone, not served from memory', async () => {
+  const older = msg('older');            // an OLDER snowflake, so the relay has something just before the target to hand back
   const m = msg(words(90));
-  const older = msg('older');
   const relay = store(older, m);
   const { agent } = setup({ digestView: true }, fakeRelay(relay));
   await agent.handleToolCall('fetch_history', { channelId: CHANNEL, view: 'digest', words: 5 });
   relay.delete(m.nativeId);
   await assert.rejects(agent.handleToolCall('fetch_message', { messageId: m.id }), /no longer there[\s\S]*deleted/);
+  assert.ok(relay.has(older.nativeId), 'premise: the relay still answers with the message just before the deleted one, and that is not the target');
 });
 
 test('R1-2: when the relay refuses the read (the agent lost access), the refusal is the answer, not a cached copy', async () => {
