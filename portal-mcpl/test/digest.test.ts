@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { PortalMessage } from '@animalabs/portal-protocol';
-import { digestMessages, DigestCache, RecentIds, DEFAULT_DIGEST_WORDS, MAX_DIGEST_WORDS, DIGEST_CHARS_PER_WORD } from '../src/digest.js';
+import { digestMessages, DigestIndex, RecentIds, DEFAULT_DIGEST_WORDS, MAX_DIGEST_WORDS, DIGEST_CHARS_PER_WORD } from '../src/digest.js';
 
 const ME = 'persona-me';
 const NO_MENTIONS = { personas: [], roles: [], users: [], everyone: false };
@@ -66,10 +66,15 @@ test('exactly the word limit is whole and one more is cut (the boundary)', () =>
   assert.match(over, /w30… \(\+1 words, full: rel-\d+\)$/);
 });
 
-test('whitespace and newlines inside a message collapse to single spaces, so a line is one line', () => {
-  const { lines } = digestMessages([msg({ text: 'a\n\n  b\t\tc\nd' })], { selfPersonaId: ME });
-  assert.equal(lines.length, 1);
-  assert.ok(lines[0]!.endsWith(': a b c d'), lines[0]);
+test('R1-3: a message shown whole keeps its own line breaks and indentation; only a cut message is flattened', () => {
+  const code = 'please check:\n```py\ndef f(x):\n    if x:\n        return 1\n    return 2\n```';
+  const whole = digestMessages([msg({ text: code, mentions: { ...NO_MENTIONS, personas: [ME] } })], { words: 5, selfPersonaId: ME }).lines[0]!;
+  assert.ok(whole.endsWith(`: ${code}`), JSON.stringify(whole));
+  const plain = digestMessages([msg({ text: 'a\n\n  b\t\tc\nd' })], { selfPersonaId: ME }).lines[0]!;
+  assert.ok(plain.endsWith(': a\n\n  b\t\tc\nd'), 'a short message that is not cut is shown as written');
+  const cut = digestMessages([msg({ text: `${words(40).replace(/ /g, '\n')}` })], { words: 5, selfPersonaId: ME }).lines[0]!;
+  assert.ok(cut.includes(': w1 w2 w3 w4 w5… (+35 words'), JSON.stringify(cut));
+  assert.ok(!cut.includes('\n'), 'a cut line is a single line');
 });
 
 test('the text is the readable one (cleanContent), not the raw one with <@ids>', () => {
@@ -152,6 +157,45 @@ test('text with no spaces is bounded too: a long CJK line or a URL is cut by cha
   assert.ok(lines[1]!.length < url.length / 4, 'the line is far shorter than the text');
 });
 
+const LONE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+const graphemes = (s: string): string[] => [...new Intl.Segmenter('en', { granularity: 'grapheme' }).segment(s)].map((x) => x.segment);
+
+test('R1-1: a character cut never leaves half of an emoji, wherever the cut falls (the API refuses an unpaired surrogate)', () => {
+  const cap = 3 * DIGEST_CHARS_PER_WORD;
+  for (let pad = 0; pad <= cap + 2; pad++) {
+    const text = 'a'.repeat(pad) + '😀'.repeat(60);
+    const line = digestMessages([msg({ text })], { words: 3, selfPersonaId: ME }).lines[0]!;
+    assert.ok(!LONE.test(line), `pad ${pad}: ${JSON.stringify(line)}`);
+    assert.ok(!LONE.test(JSON.stringify({ line }).replace(/\\u([0-9a-f]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))), `pad ${pad}: after a JSON round trip`);
+  }
+});
+
+test('R1-1: a cut counts characters as a person sees them, not UTF-16 units, so an emoji is one', () => {
+  const line = digestMessages([msg({ text: '😀'.repeat(100) })], { words: 1, selfPersonaId: ME }).lines[0]!;
+  const cap = DIGEST_CHARS_PER_WORD;
+  assert.match(line, new RegExp(`: ${'😀'.repeat(cap)}… \\(\\+${100 - cap} chars, full: rel-\\d+\\)$`));
+});
+
+test('R1-1: a joined sequence (a family, a flag, a skin tone) is kept whole or dropped whole, never cut in the middle', () => {
+  for (const unit of ['👨‍👩‍👧‍👦', '🇳🇴', '👍🏽', 'é']) {
+    for (let pad = 0; pad <= 14; pad++) {
+      const text = 'x'.repeat(pad) + unit.repeat(30);
+      const line = digestMessages([msg({ text })], { words: 1, selfPersonaId: ME }).lines[0]!;
+      const kept = line.slice(line.indexOf(': ') + 2, line.indexOf('… (+'));
+      const parts = graphemes(kept);
+      assert.ok(parts.every((g, i) => g === unit || (i < Math.ceil(pad / 1) && /^x+$/.test(g))), `${unit} pad ${pad}: ${JSON.stringify(kept)}`);
+      assert.ok(!LONE.test(line), `${unit} pad ${pad}`);
+    }
+  }
+});
+
+test('R1-1: a lone surrogate that arrives in the source text is replaced, so no line can carry one', () => {
+  const dirty = 'before \ud83d after';
+  const line = digestMessages([msg({ text: dirty })], { selfPersonaId: ME }).lines[0]!;
+  assert.ok(!LONE.test(line), JSON.stringify(line));
+  assert.ok(line.includes('before \ufffd after'), JSON.stringify(line));
+});
+
 test('ordinary prose is still cut by words, and a short message is whole', () => {
   const lines = digestMessages([msg({ text: words(40) }), msg({ text: 'ok' })], { words: 10, selfPersonaId: ME }).lines.join('\n');
   assert.ok(lines.includes('(+30 words') && !lines.includes('chars'), lines);
@@ -182,6 +226,27 @@ test('the message an addressed message replies to comes back whole too, marked',
   const { lines } = digestMessages([target, addressed, bystander], { words: 5, selfPersonaId: ME });
   assert.ok(lines[0]!.includes('★replied-to') && lines[0]!.endsWith('w50'), lines[0]);
   assert.ok(lines[2]!.includes('… (+45 words'), 'a message nobody addressed is still cut');
+});
+
+test('R1-4: the agent\'s own post that a reply answers is cut like any other, since the question was its own words', () => {
+  const mine = msg({ text: words(50), who: persona(ME, 'me'), at: '2026-10-20T14:00:00.000Z' });
+  const reply = msg({ text: 'thanks', at: '2026-10-20T14:01:00.000Z', replyToId: mine.id });
+  const { lines } = digestMessages([mine, reply], { words: 5, selfPersonaId: ME });
+  assert.ok(lines[0]!.includes('… (+45 words') && !lines[0]!.includes('★'), lines[0]);
+  assert.ok(lines[1]!.includes('★to-you'), 'the reply itself is still addressed');
+});
+
+test('R1-4: in a long reply chain with the agent, only the replies to it are whole, not its own posts as well', () => {
+  const chain: PortalMessage[] = [];
+  let parent: PortalMessage | undefined;
+  for (let i = 0; i < 10; i++) {
+    const mineNow = i % 2 === 1;
+    const m = msg({ text: words(60), who: mineNow ? persona(ME, 'me') : undefined, at: `2026-10-20T14:${String(i).padStart(2, '0')}:00.000Z`, ...(parent ? { replyToId: parent.id } : {}) });
+    chain.push(m); parent = m;
+  }
+  const lines = digestMessages(chain, { words: 5, selfPersonaId: ME }).lines;
+  const whole = lines.filter((l) => !l.includes('… (+')).length;
+  assert.equal(whole, 5, `only the five replies to the agent are whole:\n${lines.join('\n')}`);
 });
 
 test('a message that replies to someone else\'s unaddressed message pulls nothing whole', () => {
@@ -215,60 +280,49 @@ test('the digest is much smaller than the messages it stands for', () => {
   assert.ok(digest * 5 < full, `digest ${digest} vs full ${full}`);
 });
 
-// ── the cache fetch_message reads ──
+// ── the index fetch_message finds a message's place in (R1-2: it holds locations, never content) ──
 
-test('the cache returns a message by relay id or by snowflake', () => {
-  const cache = new DigestCache(10);
-  const m = msg();
-  cache.put([m]);
-  assert.equal(cache.get(m.id), m);
-  assert.equal(cache.get(m.nativeId), m);
-  assert.equal(cache.get('nope'), undefined);
+test('the index returns where a message lives, by relay id or by snowflake, and holds none of its content', () => {
+  const index = new DigestIndex(10);
+  const m = msg({ text: 'secret words' });
+  index.put([m]);
+  assert.deepEqual(index.get(m.id), { id: m.id, nativeId: m.nativeId, channelId: m.channelId });
+  assert.deepEqual(index.get(m.nativeId), index.get(m.id));
+  assert.equal(index.get('nope'), undefined);
+  assert.ok(!JSON.stringify(index.get(m.id)).includes('secret'), 'no content is kept');
+});
+
+test('a message in a thread keeps its thread id', () => {
+  const index = new DigestIndex(10);
+  const m = msg({ threadId: 'thread-9' });
+  index.put([m]);
+  assert.equal(index.get(m.id)!.threadId, 'thread-9');
 });
 
 /** The snowflake index is private; its size is what shows a leak, since a stale entry answers nothing. */
-const nativeIndexSize = (cache: DigestCache): number => (cache as unknown as { nativeToId: Map<string, string> }).nativeToId.size;
+const nativeIndexSize = (index: DigestIndex): number => (index as unknown as { nativeToId: Map<string, string> }).nativeToId.size;
 
-test('the cache keeps the newest N and lets the oldest go, by both keys', () => {
-  const cache = new DigestCache(3);
+test('the index keeps the newest N and lets the oldest go, by both keys', () => {
+  const index = new DigestIndex(3);
   const ms = Array.from({ length: 5 }, () => msg());
-  cache.put(ms);
-  assert.equal(cache.size, 3);
-  assert.equal(cache.get(ms[0]!.id), undefined);
-  assert.equal(cache.get(ms[0]!.nativeId), undefined);
-  assert.equal(cache.get(ms[1]!.nativeId), undefined);
-  for (const m of ms.slice(2)) assert.equal(cache.get(m.id), m);
-  assert.equal(nativeIndexSize(cache), 3, 'the snowflake index forgets what was evicted, or it grows without bound');
+  index.put(ms);
+  assert.equal(index.size, 3);
+  assert.equal(index.get(ms[0]!.id), undefined);
+  assert.equal(index.get(ms[0]!.nativeId), undefined);
+  assert.equal(index.get(ms[1]!.nativeId), undefined);
+  for (const m of ms.slice(2)) assert.equal(index.get(m.id)!.id, m.id);
+  assert.equal(nativeIndexSize(index), 3, 'the snowflake index forgets what was evicted, or it grows without bound');
 });
 
-test('putting a message again refreshes it instead of keeping a copy', () => {
-  const cache = new DigestCache(2);
+test('putting a message again refreshes its place instead of keeping a copy', () => {
+  const index = new DigestIndex(2);
   const [a, b, c] = [msg(), msg(), msg()];
-  cache.put([a, b]);
-  cache.put([a]);
-  cache.put([c]);
-  assert.equal(cache.get(a.id), a, 'a was refreshed, so b is the one that goes');
-  assert.equal(cache.get(b.id), undefined);
-  assert.equal(cache.size, 2);
-});
-
-test('an edited message is refreshed in place, a deleted one is dropped, and one never shown is not added', () => {
-  const cache = new DigestCache(5);
-  const m = msg({ text: 'before' });
-  cache.put([m]);
-  const edited = { ...m, content: 'after', cleanContent: 'after' } as PortalMessage;
-  cache.refresh(edited);
-  assert.equal(cache.get(m.id)!.cleanContent, 'after');
-  assert.equal(cache.get(m.nativeId)!.cleanContent, 'after');
-  const never = msg({ text: 'x' });
-  cache.refresh(never);
-  assert.equal(cache.get(never.id), undefined);
-  assert.equal(cache.size, 1);
-  cache.drop(m.id);
-  assert.equal(cache.get(m.id), undefined);
-  assert.equal(cache.get(m.nativeId), undefined);
-  assert.doesNotThrow(() => cache.drop('never-there'));
-  assert.equal(nativeIndexSize(cache), 0, 'a dropped message leaves nothing behind in the snowflake index');
+  index.put([a, b]);
+  index.put([a]);
+  index.put([c]);
+  assert.ok(index.get(a.id), 'a was refreshed, so b is the one that goes');
+  assert.equal(index.get(b.id), undefined);
+  assert.equal(index.size, 2);
 });
 
 test('RecentIds keeps the newest N ids', () => {
@@ -281,6 +335,6 @@ test('RecentIds keeps the newest N ids', () => {
   assert.ok(r.has('b') && !r.has('c'), 'adding again refreshes');
 });
 
-test('the default cache bound is the one the docs state', () => {
-  assert.equal(new DigestCache().capacity, 500);
+test('the default index bound is the one the docs state', () => {
+  assert.equal(new DigestIndex().capacity, 500);
 });
